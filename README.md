@@ -7,3 +7,6 @@ pipreq . --force
 #per installare i requirements
 pip install -r requirements.txt
 ```
+
+# TO DO
+- refactor
