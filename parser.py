@@ -24,7 +24,7 @@ def load_and_prepare(
 
     Returns
     -------
-    pid_data   : dict {pid -> DataFrame con colonne dt, ops, res, det, label}
+    pid_data   : dict {pid -> DataFrame con colonne dt, op, res, det, label}
     vocab_op   : Vocabulary per Operation
     vocab_res  : Vocabulary per Result
     vocab_det  : Vocabulary per Detail
@@ -41,7 +41,7 @@ def load_and_prepare(
     )
 
     # ── 2. Tokenizza tutto il DataFrame in una volta ─────────────────────────
-    df["ops"]  = df["Operation"].apply(vocab_op.encode)
+    df["op"]  = df["Operation"].apply(vocab_op.encode)
     df["res"] = df["Result"].apply(vocab_res.encode)
     df["det"] = df["Detail"].apply(vocab_det.encode)
     df["label"]      = df["is_ransomware"].astype(int)
@@ -61,7 +61,7 @@ def load_and_prepare(
         # dt = differenza in secondi rispetto alla riga precedente dello stesso PID
         g["dt"] = g["time_parsed"].diff().dt.total_seconds().fillna(0.0)
 
-        cols = ["dt", "ops", "res", "det", "label"]
+        cols = ["dt", "op", "res", "det", "label"]
         pid_data[pid] = g[cols]
 
     return pid_data, vocab_op, vocab_res, vocab_det

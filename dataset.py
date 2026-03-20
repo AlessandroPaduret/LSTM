@@ -41,22 +41,18 @@ class APIDataset(Dataset):
         df = self.pid_data[pid]
         return df.iloc[start : start + self.seq_len]
 
-
-def _scalar_token(row, col_scalar: str, col_list: str) -> int:
-    """Legge un token scalare o il primo elemento di una lista, robusto ad entrambi i formati."""
-    if col_scalar in row.index:
-        return int(row[col_scalar])
-    val = row[col_list]
-    return int(val[0]) if (isinstance(val, list) and val) else 0
-
+'''
+Dataframe con colonne:
+- dt  (float scalare)
+- op  (int scalare)  se parser.py è la versione aggiornata
+- res (int scalare)
+- det (lista int)
+- label (int scalare)
+'''
 
 def collate_api(batch: List[pd.DataFrame]) -> Dict[str, torch.Tensor]:
     batch_size = len(batch)
     max_len    = max(len(df) for df in batch)
-
-    # Rileva formato colonne dal primo campione
-    first_cols = batch[0].columns
-    scalar_mode = "op" in first_cols   # True = parser aggiornato
 
     op_idx  = np.zeros((batch_size, max_len), dtype=np.int64)
     res_idx = np.zeros((batch_size, max_len), dtype=np.int64)
@@ -68,14 +64,11 @@ def collate_api(batch: List[pd.DataFrame]) -> Dict[str, torch.Tensor]:
 
     for b, df in enumerate(batch):
         for t, (_, row) in enumerate(df.iterrows()):
-            if scalar_mode:
-                op_idx[b, t]  = int(row["op"])
-                res_idx[b, t] = int(row["res"])
-            else:
-                op_toks = row["op"]
-                res_toks = row["res"]
-                op_idx[b, t]  = int(op_toks[0])  if (isinstance(op_toks,  list) and op_toks)  else 0
-                res_idx[b, t] = int(res_toks[0]) if (isinstance(res_toks, list) and res_toks) else 0
+            
+            op_toks  = row["op"]
+            res_toks = row["res"]
+            op_idx[b, t]  = int(op_toks[0])  if (isinstance(op_toks,  list) and op_toks)  else 0
+            res_idx[b, t] = int(res_toks[0]) if (isinstance(res_toks, list) and res_toks) else 0
 
             dt_arr[b, t, 0] = float(row["dt"])
 
@@ -83,20 +76,22 @@ def collate_api(batch: List[pd.DataFrame]) -> Dict[str, torch.Tensor]:
             det_tokens_flat.extend(det_toks)
             det_offsets.append(det_offsets[-1] + len(det_toks))
 
+        # padding det per i timestep mancanti
         for _ in range(max_len - len(df)):
             det_tokens_flat.append(0)
             det_offsets.append(det_offsets[-1] + 1)
 
         labels.append(int(df["label"].max()))
 
+    # ── Chiavi "op" e "res" (coerenti con _batch_to_device in train.py) ────────
     return {
-        "op_idx":  torch.from_numpy(op_idx),
-        "res_idx": torch.from_numpy(res_idx),
+        "op":  torch.from_numpy(op_idx),
+        "res": torch.from_numpy(res_idx),       
         "det": (
             torch.tensor(det_tokens_flat, dtype=torch.long),
             torch.tensor(det_offsets[:-1], dtype=torch.long),
         ),
-        "dt":    torch.from_numpy(dt_arr),
+        "dt":    torch.from_numpy(dt_arr),         # (B, T, 1)
         "label": torch.tensor(labels, dtype=torch.float32),
     }
 

@@ -48,64 +48,6 @@ python train.py
 python train.py --ari
 ```
 
----
-
-## Bug risolti rispetto alla versione originale
-
-### 🔴 Bug critico: vocabolario per-PID
-
-**Problema originale:**
-```python
-# parser.py — SBAGLIATO
-for pid in datas:
-    datas[pid] = parse_data(datas[pid])  # tokenize_column chiamato QUI
-```
-`tokenize_column` costruiva un dizionario separato per ogni processo.
-Il token ID `5` per il PID 1404 significava `"CreateFile"`, ma per il PID 2000
-poteva significare `"WriteFile"`. La LSTM imparava associazioni casuali.
-
-**Fix:**
-```python
-# tokenizer.py — CORRETTO
-vocab_op, vocab_res, vocab_det = build_global_vocabularies(df)  # su tutto il CSV
-df["op_tokens"] = df["Operation"].apply(vocab_op.encode)         # poi si tokenizza
-```
-Il vocabolario viene costruito **una sola volta** sull'intero dataset, poi
-applicato uniformemente a ogni PID.
-
----
-
-### 🟡 Gradient clipping mancante
-
-Le LSTM soffrono di *exploding gradients*: senza clipping il loss oscilla.
-
-```python
-# train.py
-nn.utils.clip_grad_norm_(model.parameters(), config.CLIP_GRAD)  # max norm = 1.0
-```
-
----
-
-### 🟡 Dataset sbilanciato non gestito
-
-Con pochi dati, il modello convergeva verso "predici sempre la classe maggioritaria".
-
-```python
-# train.py
-pos_weight = n_negative / n_positive
-criterion  = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
-```
-
----
-
-### 🟡 Data leakage nel train/val split
-
-L'originale calcolava l'accuracy sullo stesso DataLoader usato per il training.
-Il refactor divide per **PID**, non per righe, così il validation set contiene
-processi mai visti durante il training.
-
----
-
 ## Architettura
 
 ```
