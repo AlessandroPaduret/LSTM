@@ -1,18 +1,20 @@
 """
 Training loop per ransomware detection LSTM.
 
-Caratteristiche rispetto all'originale:
-  - Gradient clipping (essenziale per LSTM stabili)
-  - Class weights automatici per dataset sbilanciati
-  - Train / validation split per PID (no data leakage)
-  - Early stopping
-  - Salvataggio del miglior modello
-  - Metriche complete (loss, accuracy, precision, recall, F1)
+Cambiamenti rispetto alla versione precedente:
+  - batch["op"] e batch["res"] sono ora tensori (B, T), non più tuple EmbeddingBag
+  - torch.set_num_threads: usa tutti i core CPU disponibili per le operazioni PyTorch
+  - num_workers nel DataLoader (configurato in config.py)
 """
+import os
 import torch
 import torch.nn as nn
 import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+
+# Parallelismo intra-operazione: PyTorch userà tutti i core disponibili
+# per operazioni BLAS/matriciali (LSTM, matmul, ecc.)
+torch.set_num_threads(os.cpu_count() or 4)
 
 import config
 from parser  import load_and_prepare
@@ -23,15 +25,21 @@ from model   import RansomwareLSTM, RansomwareARILSTM
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def compute_class_weight(pid_data) -> float:
-    """
-    Calcola il peso della classe positiva per BCEWithLogitsLoss.
-    pos_weight = n_negative / n_positive
-    """
-    total_pos = sum(df["label"].sum()   for df in pid_data.values())
+    total_pos = sum(df["label"].sum()        for df in pid_data.values())
     total_neg = sum((df["label"] == 0).sum() for df in pid_data.values())
     if total_pos == 0:
         return 1.0
     return float(total_neg) / float(total_pos)
+
+
+def _batch_to_device(batch, device):
+    """Sposta un batch sul device corretto."""
+    op  = batch["op"].to(device)                                          # (B, T)
+    res = batch["res"].to(device)                                         # (B, T)
+    det = (batch["det"][0].to(device), batch["det"][1].to(device))       # EmbeddingBag
+    dt  = batch["dt"].to(device)                                          # (B, T, 1)
+    lbl = batch["label"].to(device)                                       # (B,)
+    return op, res, det, dt, lbl
 
 
 @torch.no_grad()
@@ -41,11 +49,7 @@ def evaluate(model, loader, criterion, device) -> dict:
     all_preds, all_labels = [], []
 
     for batch in loader:
-        op    = (batch["op"][0].to(device),  batch["op"][1].to(device))
-        res   = (batch["res"][0].to(device), batch["res"][1].to(device))
-        det   = (batch["det"][0].to(device), batch["det"][1].to(device))
-        dt    = batch["dt"].to(device)
-        label = batch["label"].to(device)
+        op, res, det, dt, label = _batch_to_device(batch, device)
 
         logits = model(op, res, det, dt).squeeze()
         loss   = criterion(logits, label)
@@ -69,9 +73,8 @@ def evaluate(model, loader, criterion, device) -> dict:
 def train(use_ari: bool = False):
     torch.manual_seed(config.SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}  |  torch threads: {torch.get_num_threads()}")
 
-    # ── Dati ────────────────────────────────────────────────────────────────
     print("Caricamento e tokenizzazione globale del dataset...")
     pid_data, vocab_op, vocab_res, vocab_det = load_and_prepare()
 
@@ -83,8 +86,8 @@ def train(use_ari: bool = False):
     train_loader, val_loader = make_dataloaders(pid_data)
     print(f"  Train batches    : {len(train_loader)}")
     print(f"  Val   batches    : {len(val_loader)}")
+    print(f"  DataLoader workers: {config.NUM_WORKERS}")
 
-    # ── Modello ─────────────────────────────────────────────────────────────
     vocab_sizes = {
         "op":  vocab_op.size,
         "res": vocab_res.size,
@@ -96,7 +99,6 @@ def train(use_ari: bool = False):
     print(f"\nModello: {ModelClass.__name__}")
     print(f"  Parametri: {sum(p.numel() for p in model.parameters()):,}\n")
 
-    # ── Loss con class weights ───────────────────────────────────────────────
     pos_weight = compute_class_weight(pid_data)
     print(f"pos_weight (neg/pos ratio): {pos_weight:.2f}")
     criterion = nn.BCEWithLogitsLoss(
@@ -108,41 +110,32 @@ def train(use_ari: bool = False):
         optimizer, mode="max", patience=10, factor=0.5
     )
 
-    # ── Training ─────────────────────────────────────────────────────────────
     best_f1      = 0.0
     patience_cnt = 0
-    patience_max = 20  # early stopping
+    patience_max = 20
 
     for epoch in range(1, config.EPOCHS + 1):
         model.train()
-        total_loss = 0.0
 
         for batch in train_loader:
-            op    = (batch["op"][0].to(device),  batch["op"][1].to(device))
-            res   = (batch["res"][0].to(device), batch["res"][1].to(device))
-            det   = (batch["det"][0].to(device), batch["det"][1].to(device))
-            dt    = batch["dt"].to(device)
-            label = batch["label"].to(device)
+            op, res, det, dt, label = _batch_to_device(batch, device)
 
             optimizer.zero_grad()
             logits = model(op, res, det, dt).squeeze()
             loss   = criterion(logits, label)
             loss.backward()
-
-            # Gradient clipping — previene exploding gradients nelle LSTM
             nn.utils.clip_grad_norm_(model.parameters(), config.CLIP_GRAD)
-
             optimizer.step()
-            total_loss += loss.item()
 
-        train_metrics = evaluate(model, train_loader, criterion, device)
-        
-        # Stampa ogni 10 epoche o all'inizio
         if epoch % 10 == 0 or epoch <= 5:
-            val_metrics = evaluate(model, val_loader, criterion, device) if len(val_loader) > 0 else {}
-            val_str = (f"  val  → loss {val_metrics['loss']:.4f} | "
-                       f"acc {val_metrics['acc']:.3f} | f1 {val_metrics['f1']:.3f}"
-                       if val_metrics else "  (no val data)")
+            train_metrics = evaluate(model, train_loader, criterion, device)
+            val_metrics   = evaluate(model, val_loader,   criterion, device) if len(val_loader) > 0 else {}
+
+            val_str = (
+                f"  val  → loss {val_metrics['loss']:.4f} | "
+                f"acc {val_metrics['acc']:.3f} | f1 {val_metrics['f1']:.3f}"
+                if val_metrics else "  (no val data)"
+            )
             print(
                 f"Epoch {epoch:3d}/{config.EPOCHS} | "
                 f"train loss {train_metrics['loss']:.4f} | "
@@ -151,7 +144,6 @@ def train(use_ari: bool = False):
             )
             print(val_str)
 
-            # Scheduler e early stopping su val F1 (o train se non c'è val)
             monitor_f1 = val_metrics.get("f1", train_metrics["f1"]) if val_metrics else train_metrics["f1"]
             scheduler.step(monitor_f1)
 
@@ -166,7 +158,6 @@ def train(use_ari: bool = False):
                     print(f"\nEarly stopping a epoch {epoch} (best F1={best_f1:.3f})")
                     break
 
-    # ── Risultati finali ──────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Risultati finali sul training set:")
     model.load_state_dict(torch.load(config.MODEL_DIR / "best_model.pt"))
@@ -185,7 +176,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Ransomware LSTM training")
-    parser.add_argument("--ari", action="store_true", help="Usa ARI-LSTM (attenzione locale)")
+    parser.add_argument("--ari", action="store_true", help="Usa ARI-LSTM")
     args = parser.parse_args()
 
     train(use_ari=args.ari)
