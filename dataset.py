@@ -56,7 +56,7 @@ def collate_api(batch: List[pd.DataFrame]) -> Dict[str, torch.Tensor]:
 
     # Rileva formato colonne dal primo campione
     first_cols = batch[0].columns
-    scalar_mode = "op_token" in first_cols   # True = parser aggiornato
+    scalar_mode = "op" in first_cols   # True = parser aggiornato
 
     op_idx  = np.zeros((batch_size, max_len), dtype=np.int64)
     res_idx = np.zeros((batch_size, max_len), dtype=np.int64)
@@ -69,17 +69,17 @@ def collate_api(batch: List[pd.DataFrame]) -> Dict[str, torch.Tensor]:
     for b, df in enumerate(batch):
         for t, (_, row) in enumerate(df.iterrows()):
             if scalar_mode:
-                op_idx[b, t]  = int(row["op_token"])
-                res_idx[b, t] = int(row["res_token"])
+                op_idx[b, t]  = int(row["op"])
+                res_idx[b, t] = int(row["res"])
             else:
-                op_toks = row["op_tokens"]
-                res_toks = row["res_tokens"]
+                op_toks = row["op"]
+                res_toks = row["res"]
                 op_idx[b, t]  = int(op_toks[0])  if (isinstance(op_toks,  list) and op_toks)  else 0
                 res_idx[b, t] = int(res_toks[0]) if (isinstance(res_toks, list) and res_toks) else 0
 
             dt_arr[b, t, 0] = float(row["dt"])
 
-            det_toks = row["det_tokens"]
+            det_toks = row["det"]
             det_tokens_flat.extend(det_toks)
             det_offsets.append(det_offsets[-1] + len(det_toks))
 
