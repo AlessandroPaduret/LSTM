@@ -110,8 +110,8 @@ def make_dataloaders(
     rng.shuffle(pids)
 
     split      = int(len(pids) * train_ratio)
-    train_pids = pids[:split]
-    val_pids   = pids[split:]
+    train_pids = pids#[:split]
+    val_pids   = pids#[split:]
 
     train_ds = APIDataset({p: pid_data[p] for p in train_pids}, seq_len, stride)
     val_ds   = APIDataset({p: pid_data[p] for p in val_pids},   seq_len, stride)
