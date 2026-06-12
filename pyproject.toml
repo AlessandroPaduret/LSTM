@@ -11,5 +11,6 @@ dependencies = [
     "polars",
     "torch",
     "numpy",
-    "pyarrow"
+    "pyarrow",
+    "scikit-learn"
 ]

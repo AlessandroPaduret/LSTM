@@ -89,84 +89,84 @@ class SyscallLogProcessor:
         return prepared_windows
 
 
+import math
+from torch.utils.data import IterableDataset, DataLoader
+
 # ══════════════════════════════════════════════════════════════════
-#  2. PYTORCH DATASET
+#  2. PYTORCH ITERABLE DATASET (Streaming "Un po' alla volta")
 # ══════════════════════════════════════════════════════════════════
 
 
-class RansomwareSyscallDataset(Dataset):
+class RansomwareStreamDataset(IterableDataset):
     """
-    Dataset PyTorch che carica e aggrega le finestre di syscall da tutti i file di feature.
+    Legge i file CSV in streaming. Invece di caricare tutto in RAM all'avvio,
+    carica un file alla volta e genera (yield) le finestre al volo.
     """
 
     def __init__(
         self,
         file_paths: list[str],
-        strategy: Literal["n-operations", "time-windows"],
-        window_size: int = 10,
+        strategy: str,
+        window_size: int = 50,
         time_window_secs: float = 5.0,
+        shuffle: bool = False,
     ):
-        self.windows = []
-        for path in file_paths:
+        self.file_paths = file_paths
+        self.strategy = strategy
+        self.window_size = window_size
+        self.time_window_secs = time_window_secs
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        # Facciamo una copia dei file per non alterare la lista originale
+        files = list(self.file_paths)
+
+        # Rimescoliamo l'ordine dei file ad ogni nuova epoca se richiesto
+        if self.shuffle:
+            random.shuffle(files)
+
+        # Gestione del multi-processing (se config.NUM_WORKERS > 0)
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # Dividiamo i file in modo equo tra i vari worker della CPU
+            per_worker = int(math.ceil(len(files) / float(worker_info.num_workers)))
+            worker_id = worker_info.id
+            files = files[worker_id * per_worker : (worker_id + 1) * per_worker]
+
+        # Streaming reale: leggiamo un file alla volta
+        for path in files:
             processor = SyscallLogProcessor(path)
             file_windows = processor.create_windows(
-                strategy=strategy,
-                window_size=window_size,
-                time_window_secs=time_window_secs,
+                strategy=self.strategy,
+                window_size=self.window_size,
+                time_window_secs=self.time_window_secs,
             )
-            self.windows.extend(file_windows)
-
-    def __len__(self):
-        return len(self.windows)
-
-    def __getitem__(self, idx):
-        return self.windows[idx]
+            # Inviamo le finestre trovate al DataLoader una ad una
+            for window in file_windows:
+                yield window
 
 
 # ══════════════════════════════════════════════════════════════════
-#  3. PYTORCH DATALOADER CUSTOM (Padding)
+#  3. PYTORCH DATALOADER CUSTOM (con padding di sicurezza)
 # ══════════════════════════════════════════════════════════════════
 
 
 def pad_collate_fn(batch):
-    """
-    Effettua il padding a zero delle finestre che hanno lunghezze diverse all'interno del batch.
-    Per le etichette usiamo -1.0 come valore di padding se si desidera ignorarle nel calcolo della loss,
-    oppure 0.0 a seconda della configurazione della tua funzione di Loss.
-    """
-    features = [item[0] for item in batch]
-    labels = [item[1] for item in batch]
+    """Padding delle sequenze. Includiamo un limite massimo di sicurezza (es. 500)
+    per evitare OOM se un ransomware fa troppe syscall in 1 secondo."""
+    MAX_SEQ_LEN = 500
 
-    # padding_value=0.0 livella le feature (Delta_Time e Token) alla lunghezza massima del batch
+    # Tronchiamo in modo preventivo
+    features = [item[0][:MAX_SEQ_LEN] for item in batch]
+    labels = [item[1][:MAX_SEQ_LEN] for item in batch]
+
     features_padded = pad_sequence(features, batch_first=True, padding_value=0.0)
-
-    # Per i target/labels usiamo -1.0 come valore di padding (comodo per CrossEntropyLoss(ignore_index=-1))
     labels_padded = pad_sequence(labels, batch_first=True, padding_value=-1.0)
 
     return features_padded, labels_padded
 
 
 class RansomwareSyscallDataLoader(DataLoader):
-    """
-    DataLoader pronto per l'addestramento LSTM / GRU.
-    Dispone del metodo per dividere automaticamente i file in Train e Validation set.
-    """
-
-    def __init__(
-        self,
-        dataset: RansomwareSyscallDataset,
-        batch_size: int = 32,
-        shuffle: bool = True,
-        **kwargs,
-    ):
-        super().__init__(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=pad_collate_fn,
-            **kwargs,
-        )
-
     @classmethod
     def create_splits_from_folder(
         cls,
@@ -174,11 +174,11 @@ class RansomwareSyscallDataLoader(DataLoader):
         val_ratio: float = 0.2,
         batch_size: int = 32,
         seed: int = 42,
-        strategy: Literal["n-operations", "time-windows"] = "n-operations",
-        window_size: int = 10,
+        strategy: str = "n-operations",
+        window_size: int = 50,
         time_window_secs: float = 5.0,
-    ) -> tuple["RansomwareSyscallDataLoader", "RansomwareSyscallDataLoader"]:
-
+        num_workers: int = 0,
+    ):
         all_files = glob.glob(os.path.join(data_dir, "*.csv"))
         all_files.sort()
 
@@ -196,15 +196,27 @@ class RansomwareSyscallDataLoader(DataLoader):
             f"[INFO] File allocati al Train: {len(train_files)} | Al Validation: {len(val_files)}"
         )
 
-        train_dataset = RansomwareSyscallDataset(
-            train_files, strategy, window_size, time_window_secs
+        # Notare come passiamo shuffle=True/False al Dataset e non al DataLoader
+        train_dataset = RansomwareStreamDataset(
+            train_files, strategy, window_size, time_window_secs, shuffle=True
         )
-        val_dataset = RansomwareSyscallDataset(
-            val_files, strategy, window_size, time_window_secs
+        val_dataset = RansomwareStreamDataset(
+            val_files, strategy, window_size, time_window_secs, shuffle=False
         )
 
-        train_loader = cls(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = cls(val_dataset, batch_size=batch_size, shuffle=False)
+        # Il DataLoader standard gestisce gli IterableDataset nativamente
+        train_loader = cls(
+            train_dataset,
+            batch_size=batch_size,
+            collate_fn=pad_collate_fn,
+            num_workers=num_workers,
+        )
+        val_loader = cls(
+            val_dataset,
+            batch_size=batch_size,
+            collate_fn=pad_collate_fn,
+            num_workers=num_workers,
+        )
 
         return train_loader, val_loader
 
