@@ -71,7 +71,7 @@ class Vocabulary:
         return tokens if tokens else [0]
 
 
-# ── Costruzione vocabolari globali ─────────────────────────────────────────────
+# ── Costruzione vocabolari globali(old) ─────────────────────────────────────────────
 
 def build_global_vocabularies(
     df: pd.DataFrame,
@@ -89,3 +89,10 @@ def build_global_vocabularies(
     vocab_res = Vocabulary(top_n_res).build(df["Result"])
     vocab_det = Vocabulary(top_n_det).build(df["Detail"])
     return vocab_op, vocab_res, vocab_det
+
+def syscall_vocabularies(
+    df: pd.DataFrame,
+    top_n_func: int = 100,
+) -> Tuple[Vocabulary]:
+    """Costruisce vocabolari globali per Function"""
+    return Vocabulary(top_n_func).build(df["Function"])
