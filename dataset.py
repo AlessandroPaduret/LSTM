@@ -1,149 +1,270 @@
-"""
-Dataset PyTorch per sequenze di API call — LAZY VERSION.
-
-op_token  (int scalare)  se parser.py è la versione aggiornata
-op_tokens (lista int)    se parser.py è la versione originale
-Il collate rileva automaticamente quale formato è presente.
-"""
-
+import os
+import io
+import glob
+import random
+import tempfile
 import torch
+from typing import Literal
+import polars as pl
 from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Tuple
-import pandas as pd
-import numpy as np
+from torch.nn.utils.rnn import pad_sequence
 
-import config
+# ══════════════════════════════════════════════════════════════════
+#  1. DATA PROCESSOR (Ottimizzato per le nuove Feature)
+# ══════════════════════════════════════════════════════════════════
 
 
-class APIDataset(Dataset):
+class SyscallLogProcessor:
+    """
+    Processore Polars per i file di feature estratti.
+    Divide la sequenza di syscall in finestre (temporali o per numero di operazioni).
+    """
+
+    FEATURE_COLS = ["Delta_Time", "Token"]
+    LABEL_COL = "Is_Ransomware"
+
+    def __init__(self, source: str | io.StringIO):
+        # Leggiamo il file CSV delle feature
+        self.df = pl.read_csv(source)
+
+    def create_windows(
+        self,
+        strategy: Literal["n-operations", "time-windows"],
+        window_size: int = 10,
+        time_window_secs: float = 5.0,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+
+        if self.df.is_empty():
+            return []
+
+        # Assicuriamoci del tipo di dati corretto
+        working_df = self.df.with_columns(
+            [
+                pl.col("Delta_Time").cast(pl.Float32),
+                pl.col("Token").cast(
+                    pl.Float32
+                ),  # Cast a float per unirlo nel tensor delle feature
+                pl.col(self.LABEL_COL).cast(pl.Float32),
+            ]
+        )
+
+        # ── STRATEGIA 1: Finestre per Numero di Operazioni ──
+        if strategy == "n-operations":
+            working_df = working_df.with_columns(
+                pl.int_range(0, pl.len()).alias("op_index")
+            ).with_columns((pl.col("op_index") // window_size).alias("window_id"))
+
+        # ── STRATEGIA 2: Finestre Temporali (Basate sul Delta_Time cumulativo) ──
+        elif strategy == "time-windows":
+            # Delta_Time è in microsecondi -> cum_sum() / 1e6 ci dà i secondi passati dall'inizio del log
+            working_df = working_df.with_columns(
+                (pl.col("Delta_Time").cum_sum() / 1e6).alias("elapsed_seconds")
+            ).with_columns(
+                (pl.col("elapsed_seconds") // time_window_secs).alias("window_id")
+            )
+        else:
+            raise ValueError(f"Strategia sconosciuta: {strategy}")
+
+        # Raggruppiamo per ID della finestra mantenendo rigorosamente l'ordine temporale
+        grouped = working_df.group_by(["window_id"], maintain_order=True).agg(
+            [pl.col(self.FEATURE_COLS), pl.col(self.LABEL_COL)]
+        )
+
+        prepared_windows = []
+        for row in grouped.iter_rows(named=True):
+            # Estraiamo le liste di Delta_Time e Token per questa finestra
+            features_list = [row[f] for f in self.FEATURE_COLS]
+            # Trasponiamo la matrice da (2, Lunghezza_Finestra) a (Lunghezza_Finestra, 2)
+            features_transposed = list(zip(*features_list))
+
+            if not features_transposed:
+                continue
+
+            # Creiamo i tensori PyTorch
+            features_tensor = torch.tensor(features_transposed, dtype=torch.float32)
+            labels_tensor = torch.tensor(row[self.LABEL_COL], dtype=torch.float32)
+
+            prepared_windows.append((features_tensor, labels_tensor))
+
+        return prepared_windows
+
+
+# ══════════════════════════════════════════════════════════════════
+#  2. PYTORCH DATASET
+# ══════════════════════════════════════════════════════════════════
+
+
+class RansomwareSyscallDataset(Dataset):
+    """
+    Dataset PyTorch che carica e aggrega le finestre di syscall da tutti i file di feature.
+    """
+
     def __init__(
         self,
-        pid_data: Dict[int, pd.DataFrame],
-        seq_len: int = config.SEQ_LEN,
-        stride: int = config.STRIDE,
+        file_paths: list[str],
+        strategy: Literal["n-operations", "time-windows"],
+        window_size: int = 10,
+        time_window_secs: float = 5.0,
     ):
-        self.seq_len = seq_len
-        self.pid_data = pid_data
-        self.index: List[Tuple[int, int]] = []
-
-        for pid, df in pid_data.items():
-            n = len(df)
-            if n < seq_len:
-                self.index.append((pid, 0))
-            else:
-                for start in range(0, n - seq_len + 1, stride):
-                    self.index.append((pid, start))
-
-    def __len__(self) -> int:
-        return len(self.index)
-
-    def __getitem__(self, idx: int) -> pd.DataFrame:
-        pid, start = self.index[idx]
-        df = self.pid_data[pid]
-        return df.iloc[start : start + self.seq_len]
-
-
-"""
-Dataframe con colonne:
-- dt  (float scalare)
-- op  (int scalare)  se parser.py è la versione aggiornata
-- res (int scalare)
-- det (lista int)
-- label (int scalare)
-"""
-
-
-def collate_api(batch: List[pd.DataFrame]) -> Dict[str, torch.Tensor]:
-    batch_size = len(batch)
-    max_len = max(len(df) for df in batch)
-
-    op_idx = np.zeros((batch_size, max_len), dtype=np.int64)
-    res_idx = np.zeros((batch_size, max_len), dtype=np.int64)
-    dt_arr = np.zeros((batch_size, max_len, 1), dtype=np.float32)
-
-    det_tokens_flat: List[int] = []
-    det_offsets: List[int] = [0]
-    labels: List[int] = []
-
-    for b, df in enumerate(batch):
-        for t, (_, row) in enumerate(df.iterrows()):
-            op_toks = row["op"]
-            res_toks = row["res"]
-            op_idx[b, t] = (
-                int(op_toks[0]) if (isinstance(op_toks, list) and op_toks) else 0
+        self.windows = []
+        for path in file_paths:
+            processor = SyscallLogProcessor(path)
+            file_windows = processor.create_windows(
+                strategy=strategy,
+                window_size=window_size,
+                time_window_secs=time_window_secs,
             )
-            res_idx[b, t] = (
-                int(res_toks[0]) if (isinstance(res_toks, list) and res_toks) else 0
+            self.windows.extend(file_windows)
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        return self.windows[idx]
+
+
+# ══════════════════════════════════════════════════════════════════
+#  3. PYTORCH DATALOADER CUSTOM (Padding)
+# ══════════════════════════════════════════════════════════════════
+
+
+def pad_collate_fn(batch):
+    """
+    Effettua il padding a zero delle finestre che hanno lunghezze diverse all'interno del batch.
+    Per le etichette usiamo -1.0 come valore di padding se si desidera ignorarle nel calcolo della loss,
+    oppure 0.0 a seconda della configurazione della tua funzione di Loss.
+    """
+    features = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
+
+    # padding_value=0.0 livella le feature (Delta_Time e Token) alla lunghezza massima del batch
+    features_padded = pad_sequence(features, batch_first=True, padding_value=0.0)
+
+    # Per i target/labels usiamo -1.0 come valore di padding (comodo per CrossEntropyLoss(ignore_index=-1))
+    labels_padded = pad_sequence(labels, batch_first=True, padding_value=-1.0)
+
+    return features_padded, labels_padded
+
+
+class RansomwareSyscallDataLoader(DataLoader):
+    """
+    DataLoader pronto per l'addestramento LSTM / GRU.
+    Dispone del metodo per dividere automaticamente i file in Train e Validation set.
+    """
+
+    def __init__(
+        self,
+        dataset: RansomwareSyscallDataset,
+        batch_size: int = 32,
+        shuffle: bool = True,
+        **kwargs,
+    ):
+        super().__init__(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=pad_collate_fn,
+            **kwargs,
+        )
+
+    @classmethod
+    def create_splits_from_folder(
+        cls,
+        data_dir: str,
+        val_ratio: float = 0.2,
+        batch_size: int = 32,
+        seed: int = 42,
+        strategy: Literal["n-operations", "time-windows"] = "n-operations",
+        window_size: int = 10,
+        time_window_secs: float = 5.0,
+    ) -> tuple["RansomwareSyscallDataLoader", "RansomwareSyscallDataLoader"]:
+
+        all_files = glob.glob(os.path.join(data_dir, "*.csv"))
+        all_files.sort()
+
+        if not all_files:
+            raise ValueError(f"Nessun file .csv di feature trovato in {data_dir}")
+
+        random.seed(seed)
+        random.shuffle(all_files)
+
+        split_idx = int(len(all_files) * (1 - val_ratio))
+        train_files = all_files[:split_idx]
+        val_files = all_files[split_idx:]
+
+        print(
+            f"[INFO] File allocati al Train: {len(train_files)} | Al Validation: {len(val_files)}"
+        )
+
+        train_dataset = RansomwareSyscallDataset(
+            train_files, strategy, window_size, time_window_secs
+        )
+        val_dataset = RansomwareSyscallDataset(
+            val_files, strategy, window_size, time_window_secs
+        )
+
+        train_loader = cls(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = cls(val_dataset, batch_size=batch_size, shuffle=False)
+
+        return train_loader, val_loader
+
+
+# ══════════════════════════════════════════════════════════════════
+#  4. MAIN TEST BLOCK
+# ══════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    print("--- Avvio Test del Nuovo DataLoader di Feature ---\n")
+
+    # Creazione di dati finti coerenti con l'estrattore precedente
+    # Struttura: Delta_Time (in microsecondi), Token, Is_Ransomware
+    # File 1: 3 syscall ravvicinate
+    csv_dummy_1 = """Delta_Time,Token,Is_Ransomware
+0.0,4,1
+540.0,1,1
+1200.0,4,1
+"""
+    # File 2: 5 syscall con un salto temporale netto (per testare le finestre temporali)
+    csv_dummy_2 = """Delta_Time,Token,Is_Ransomware
+0.0,2,0
+150.0,3,0
+4000000.0,8,0
+200.0,5,0
+150000.0,9,0
+"""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "proc_hash_1.csv"), "w") as f:
+            f.write(csv_dummy_1)
+        with open(os.path.join(tmpdir, "proc_hash_2.csv"), "w") as f:
+            f.write(csv_dummy_2)
+
+        # Inizializziamo usando la strategia a finestre temporali da 2 secondi
+        # (4000000.0 microsecondi = 4 secondi, quindi genererà più finestre)
+        train_loader, val_loader = (
+            RansomwareSyscallDataLoader.create_splits_from_folder(
+                data_dir=tmpdir,
+                val_ratio=0.5,
+                batch_size=2,
+                strategy="time-windows",
+                time_window_secs=2.0,
             )
+        )
 
-            dt_arr[b, t, 0] = float(row["dt"])
+        print(f"Finestre estratte nel Train Dataset: {len(train_loader.dataset)}")
+        print(f"Finestre estratte nel Val Dataset:   {len(val_loader.dataset)}\n")
 
-            det_toks = row["det"]
-            det_tokens_flat.extend(det_toks)
-            det_offsets.append(det_offsets[-1] + len(det_toks))
-
-        # padding det per i timestep mancanti
-        for _ in range(max_len - len(df)):
-            det_tokens_flat.append(0)
-            det_offsets.append(det_offsets[-1] + 1)
-
-        labels.append(int(df["label"].max()))
-
-    # ── Chiavi "op" e "res" (coerenti con _batch_to_device in train.py) ────────
-    return {
-        "op": torch.from_numpy(op_idx),
-        "res": torch.from_numpy(res_idx),
-        "det": (
-            torch.tensor(det_tokens_flat, dtype=torch.long),
-            torch.tensor(det_offsets[:-1], dtype=torch.long),
-        ),
-        "dt": torch.from_numpy(dt_arr),  # (B, T, 1)
-        "label": torch.tensor(labels, dtype=torch.float32),
-    }
-
-
-def make_dataloaders(
-    pid_data: Dict[int, pd.DataFrame],
-    seq_len: int = config.SEQ_LEN,
-    stride: int = config.STRIDE,
-    batch_size: int = config.BATCH_SIZE,
-    train_ratio: float = config.TRAIN_RATIO,
-    seed: int = config.SEED,
-    num_workers: int = config.NUM_WORKERS,
-) -> Tuple[DataLoader, DataLoader]:
-    pids = list(pid_data.keys())
-    rng = np.random.default_rng(seed)
-    rng.shuffle(pids)
-
-    split = int(len(pids) * train_ratio)
-    train_pids = pids[:split]
-    val_pids = pids[split:]
-
-    train_ds = APIDataset({p: pid_data[p] for p in train_pids}, seq_len, stride)
-    val_ds = APIDataset({p: pid_data[p] for p in val_pids}, seq_len, stride)
-
-    print(f"  Campioni train   : {len(train_ds):,}")
-    print(f"  Campioni val     : {len(val_ds):,}")
-
-    worker_kwargs = dict(
-        num_workers=num_workers,
-        persistent_workers=num_workers > 0,
-        pin_memory=False,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_api,
-        **worker_kwargs,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_api,
-        **worker_kwargs,
-    )
-
-    return train_loader, val_loader
+        print("--- Verifica Struttura Tensori del Primo Batch ---")
+        for features, labels in train_loader:
+            print(
+                f"Shape delle Features: {list(features.shape)} -> (Batch, Lunghezza_Sequenza, Feature_Dim)"
+            )
+            print(
+                f"Shape delle Labels:   {list(labels.shape)} -> (Batch, Lunghezza_Sequenza)"
+            )
+            print("\nPrimo elemento del Batch (Features):")
+            print("Formato di ogni riga: [Delta_Time, Token]")
+            print(features[0])
+            print("\nCorrispettive Labels di questa sequenza (nota il padding a -1):")
+            print(labels[0])
+            break
