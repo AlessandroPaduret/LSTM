@@ -3,3 +3,5 @@ temp*
 *.log
 checkpoints*
 data
+vocab
+features
