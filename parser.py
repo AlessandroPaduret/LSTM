@@ -1,59 +1,67 @@
+"""
+Parsing e preprocessing del CSV di log.
 
+Flusso corretto:
+  1. Carica il CSV completo
+  2. Costruisci vocabolari GLOBALI (una sola volta)
+  3. Calcola dt per ogni PID
+  4. Tokenizza con i vocabolari globali
+  5. Suddividi per PID
+"""
 import pandas as pd
-import tokenizer as tk
+from typing import Dict, Tuple
 
-'''
-Questo modulo si occupa di leggere parda un dataframe e mette 
-i token al posto del testo
-e il dt al posto del tempo
-- inuput: Dataframe
-- output: dataframe con dt, Operazioni tokenizzate, Dettagli tokenizzate e infine i risultati dell'operazione
-'''
-def parse_data(data: pd.DataFrame) -> pd.DataFrame:
+from tokenizer import Vocabulary, build_global_vocabularies
+import config
 
-    data['dt'] = pd.to_datetime(
-        data['Time of Day'].str.strip(),
-        format='%I:%M:%S.%f %p',
-        errors='coerce'
-    ).diff().dt.total_seconds().fillna(0) # Calcola la differenza in secondi tra le righe e riempie i valori NaN con 0
-    
-    # Tokenizza le operazioni, i dettagli e i risultati
-    ops = tk.tokenize_column(data['Operation'], top_n=100)
-    data['Operation'] = data['Operation'].apply(lambda x: tk.get_multi_tokens(x, ops))
-    det = tk.tokenize_column(data['Detail'], top_n=100)
-    data['Detail'] = data['Detail'].apply(lambda x: tk.get_multi_tokens(x, det))
-    res = tk.tokenize_column(data['Result'], top_n=100)
-    data['Result'] = data['Result'].apply(lambda x: tk.get_multi_tokens(x, res))
 
-    return data
+def load_and_prepare(
+    file_path: str = str(config.LOG_FILE),
+) -> Tuple[Dict[int, pd.DataFrame], Vocabulary, Vocabulary, Vocabulary]:
+    """
+    Carica il CSV, costruisce vocabolari globali e restituisce
+    un dizionario {pid: dataframe} con colonne già tokenizzate.
 
-'''
-Una funzione che serve a dividere un grande datagrame in più piccoli, uno per ogni PID, in modo da poter addestrare un modello LSTM per ogni processo
-- input: dataframe con tutte le API di tutti i processi
-- output: dizionario con chiave il PID e valore il dataframe con le API di quel processo
-'''
-def split_by_pid(df: pd.DataFrame) -> dict:
-    pid_dict = {}
-    for pid, group in df.groupby('PID'):
-        pid_dict[pid] = group.reset_index(drop=True)
-    return pid_dict
+    Returns
+    -------
+    pid_data   : dict {pid -> DataFrame con colonne dt, op, res, det, label}
+    vocab_op   : Vocabulary per Operation
+    vocab_res  : Vocabulary per Result
+    vocab_det  : Vocabulary per Detail
+    """
+    df = pd.read_csv(file_path)
+    df.drop(columns=["Path"], inplace=True, errors="ignore")
 
-'''
-Esempio di utilizzo delle funzioni sopra, legge il file CSV, lo divide per PID e poi tokenizza ogni dataframe
-'''
-def test():
-    file_path = "/home/arch_btw/cloud/GoogleDrive/unipd/2.2/Progetto Cyber/data/API/Logfile.CSV"
-    csv = pd.read_csv(file_path)
-    #rimuoviamo le colonne che non ci servono più
-    csv.drop(columns=['Path'], inplace=True)
-    datas = split_by_pid(csv)
+    # ── 1. Vocabolari globali ────────────────────────────────────────────────
+    vocab_op, vocab_res, vocab_det = build_global_vocabularies(
+        df,
+        top_n_op  = config.TOP_N_OP,
+        top_n_res = config.TOP_N_RES,
+        top_n_det = config.TOP_N_DET,
+    )
 
-    print("Logfile.CSV spezzato con successo.")
-    print(datas)
-    for pid in datas:
-        parse_data(datas[pid])
-        datas[pid].drop(columns=['Time of Day', 'PID', 'Process Name'], inplace=True)
-    print("Il dataframe è stato diviso in più piccoli dataframe, uno per ogni PID.")
-    print(datas)
+    # ── 2. Tokenizza tutto il DataFrame in una volta ─────────────────────────
+    df["op"]  = df["Operation"].apply(vocab_op.encode)
+    df["res"] = df["Result"].apply(vocab_res.encode)
+    df["det"] = df["Detail"].apply(vocab_det.encode)
+    df["label"]      = df["is_ransomware"].astype(int)
 
-# test()
+    # ── 3. Calcola dt per PID (differenza temporale intra-processo) ──────────
+    df["time_parsed"] = pd.to_datetime(
+        df["Time of Day"].str.strip(),
+        format="%I:%M:%S.%f %p",
+        errors="coerce",
+    )
+
+    pid_data: Dict[int, pd.DataFrame] = {}
+
+    for pid, group in df.groupby("PID"):
+        g = group.copy().reset_index(drop=True)
+
+        # dt = differenza in secondi rispetto alla riga precedente dello stesso PID
+        g["dt"] = g["time_parsed"].diff().dt.total_seconds().fillna(0.0)
+
+        cols = ["dt", "op", "res", "det", "label"]
+        pid_data[pid] = g[cols]
+
+    return pid_data, vocab_op, vocab_res, vocab_det
