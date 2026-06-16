@@ -187,13 +187,15 @@ def train(use_ari: bool = False):
             else:
                 patience_cnt += 1
                 if patience_cnt >= patience_max:
-                    print(f"\nEarly stopping a epoch {epoch} (best F1={best_f1:.3f})")
+                    print(
+                        f"\nEarly stopping a epoch {epoch} perché il modello non impara più(best F1={best_f1:.3f})"
+                    )
                     break
 
     # 6. Report Finale
     print("\n" + "=" * 60)
     print("Risultati finali sul training set (Best Model):")
-    model.load_state_dict(torch.load(best_model_path))
+
     final_train = evaluate(model, train_loader, criterion, device)
     for k, v in final_train.items():
         print(f"  {k:10s}: {v:.4f}")
