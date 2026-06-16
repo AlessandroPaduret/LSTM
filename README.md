@@ -4,18 +4,14 @@ Questo progetto implementa una rete neurale ricorrente (**LSTM**) per la rilevaz
 
 ## Setup e Preparazione Dati
 
-Assicurati di avere `uv` installato. Il workflow di elaborazione dati è diviso in due fasi:
+Crea nella cartella raw varie cartelle il cui nome sarà corrispondente ai vari ransomware della traccia.
+In ogni cartella dovrà esserci un file di tipo .csv che contiene un pezzo di log che serve ad allenare il modello.
 
-1. **Etichettatura (`label_data.py`):** Assegna l'etichetta `1` (Ransomware) o `0` (Legittimo) ai file CSV grezzi basandosi sulla struttura delle directory.
-2. **Estrazione (`extractor.py`):** Elabora i CSV etichettati per generare i file di feature pronti per il training.
-
+Nel terminale eseguire il comando 
 ```bash
-# 1. Etichetta i file (modifica i path nel file prima di eseguire)
-uv run label_data.py
-
-# 2. Estrai le feature (modifica i path nel file prima di eseguire)
-uv run extractor.py
+uv run preprocess.py
 ```
+
 
 ## Utilizzo
 
